@@ -117,6 +117,48 @@ CREATE TABLE IF NOT EXISTS word_revision_items (
   end_ms          INTEGER NOT NULL,           -- 修正后结束毫秒
   UNIQUE(word_revision_id, ord)
 );
+
+-- 多语言译文字幕：译文沿用源字幕的起止时间与词区间，本身不携带任何时间/切点/原文。
+-- 同一语言、每条当前字幕最多一份非历史译文（由下方部分唯一索引强制）。
+--   current  当前有效（源文本/时间/词区间与快照一致且满足现行规则）
+--   review   待复核（保存后源字幕文本、时间或词区间发生变化；仅锁定/展示顺序变化不进入此态）
+--   history  历史（源字幕行被重排删除或重新导入；subtitle_id 置空，不自动挪用到新行）
+CREATE TABLE IF NOT EXISTS translations (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id           INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang                 TEXT NOT NULL,                -- 非空目标语言代号（如 en / ja-JP）
+  subtitle_id          INTEGER REFERENCES subtitles(id) ON DELETE SET NULL, -- 当前源字幕；行删除后留空作历史
+  text                 TEXT NOT NULL,                -- 译文文本（不改动源字幕的任何内容）
+  status               TEXT NOT NULL DEFAULT 'current',
+  version              INTEGER NOT NULL DEFAULT 1,   -- 译文版本（保存修改时携带，乐观锁）
+  cue_version_snapshot INTEGER NOT NULL,             -- 保存/确认时读取的源字幕行版本
+  src_text             TEXT NOT NULL,                -- 保存时源字幕文本快照
+  src_start_ms         INTEGER NOT NULL,             -- 保存时源字幕开始毫秒快照
+  src_end_ms           INTEGER NOT NULL,             -- 保存时源字幕结束毫秒快照
+  src_word_start       INTEGER NOT NULL,             -- 保存时源字幕词区间快照
+  src_word_end         INTEGER NOT NULL,
+  created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 同一语言每条当前字幕最多一份译文（历史行 subtitle_id 已置空，不参与唯一约束）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_translations_one_per_cue
+  ON translations(project_id, lang, subtitle_id)
+  WHERE status != 'history';
+CREATE INDEX IF NOT EXISTS idx_translations_project_lang
+  ON translations(project_id, lang, status);
+
+-- 按语言导出的不可变 WebVTT 快照（与原文导出 exports 互不影响）
+CREATE TABLE IF NOT EXISTS translation_exports (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang       TEXT NOT NULL,
+  version    INTEGER NOT NULL,               -- 项目内按语言递增，确认一次 +1
+  content    TEXT NOT NULL,                  -- WebVTT 快照，确认后不再改变
+  cue_count  INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, lang, version)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };

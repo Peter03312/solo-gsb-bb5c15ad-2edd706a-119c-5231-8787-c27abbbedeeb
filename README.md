@@ -14,6 +14,7 @@
 - **批量修订提议**：校对者可对**同一项目的一组未锁定字幕**提交待采纳修订（逐项给出字幕 ID、读取时行版本、替代文本、可选起止毫秒、附说明）；**提交只保存原值与当时规则版本，不动正式字幕**。预览并列原值/当前值/建议值，按当前规则核对整组候选（词区间、词时段、切点、相邻字幕、字数/时长/字速），逐处指出冲突；采纳时在**同一事务**内再次核对目标仍存在且未锁定、行版本与规则版本，通过后整版校验并原子写入全部修订、推进字幕集版本——**任一过期或违规则整组不生效**并返回当前值与原因；已采纳提议重复提交不再改字幕，提议历史可查。
 - **乐观锁**：规则与每条字幕都带版本号，过期提交返回 `409` 与当前内容；字幕集整体有 `sub_version`，重排/导出携带以防并发覆盖。
 - **导出**：确认后生成按时间升序的 WebVTT，存为**不可变版本快照**，可随时再次下载；后续修改不影响旧文件。导出前会完整校验（含锁定字幕），违规则拒绝并列出问题。
+- **多语言译文字幕**：按原时间轴维护多语言译文。校对者以**非空目标语言代号、字幕 ID、读取时行版本 `cue_version` 与译文版本 `version`**（新建传 0/省略）保存译文；查询逐行并列原文、译文与状态（`current`/`review`/`missing`）。同一语言每条当前字幕最多一份译文。译文**沿用源字幕起止与词区间**，接口不接受任何时间/切点/原文字段，且须满足当前**最大字数与字速**规则（时长随源行）。源字幕**文本/时间/词区间**变化 → 译文自动转**待复核**；仅锁定或展示顺序变化不使译文失效；重排删除的原行译文**留作历史**，新行视为缺译，**不按序号自动挪用**。校对者可在当前源行上确认待复核译文，过期版本或无效译文返回当前值与原因且不改数据。按语言导出前须确认当前每行均有有效译文且整版符合时间与切点约束，否则分类列出缺漏/待复核/无效/冲突且**不生成快照**；成功导出的译文 WebVTT 快照**不可变**，与原文导出相互独立。
 
 ## 启动
 
@@ -61,6 +62,7 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 5. **逐词时间修正（校对者流程）**：在左侧 ⑥ 面板按 JSON 提交一组词时间修正（或"填入所有词"后只保留要改的词），必须携带读取时的 `sub_version`；提交后自动打开预览，查看**受影响字幕**（将重排的未锁定行 / 含修正词的锁定行）、逐词原值/当前值/建议值与候选整版，全部通过时点"确认修正"（原子更新词时间+重排+推进版本；失败整组不变）。也可用 `examples/word-revisions-api.sh` 走纯 HTTP 流程。
 6. **批量修订提议（校对者流程）**：在左侧 ⑤ 面板按 JSON 提交一组字幕修订（或"填入所有行"后删改；只针对未锁定字幕），提交后自动打开预览，逐项并列**原值 / 当前值 / 建议值**并标注每处冲突；全部通过时点"整组采纳"（原子写入，失败整组不生效）。也可用 `examples/revisions-api.sh` 走纯 HTTP 流程。
 7. **导出**：点"确认当前字幕并导出 WebVTT"，生成 v1、v2…… 任意版本可随时重新下载。词修正确认与字幕修订采纳均不影响已生成的旧快照。
+8. **多语言译文（本轮新增）**：在左侧 ⑦ 面板填入语言代号（如 `en`）并"载入语言"，逐行对照原文保存译文；源行变更后状态变"待复核"，可"✓ 确认仍适用"或重新保存；全部有效后点"校验并导出该语言 WebVTT"，缺漏/冲突会分类列出且不生成快照。HTTP 流程见 `examples/translations-api.sh`。
 
 ## API 摘要
 
@@ -86,6 +88,13 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 | `GET` | `/api/projects/:id/word-revisions/:wrid` | 单个提议：逐项 `orig`（读取时原值）/`current`（当前词，含文本）/`proposed`（建议值） |
 | `POST` | `/api/projects/:id/word-revisions/:wrid/preview` | 只读预览：受影响字幕（`replaced`/`affected_locked`）、候选整版 `subtitles`（`origin=kept/new`）、逐项与整版冲突 |
 | `POST` | `/api/projects/:id/word-revisions/:wrid/confirm` | 事务内再次核对并原子确认；过期类（字幕集版本/词漂移/词缺失/重复确认）→ `409`，锁定或排版不可兼顾 → `422`，均带 `current` 与每项 `reasons` |
+| `GET` | `/api/projects/:id/translations` | 译文语言总览（各语言 current/review/历史条数与导出数） |
+| `GET` | `/api/projects/:id/translations/:lang` | 单语言并列查询：逐行原文/译文/状态（`missing`/`current`/`review`）、现行规则 `invalid_reasons`、导出列表与历史译文 |
+| `PUT` | `/api/projects/:id/translations/:lang/subtitles/:sid` | 保存/更新译文：`{text, cue_version, version?}`；新建 201 / 更新 200，行版本或译文版本过期 → `409`，译文超字数/字速 → `422` |
+| `POST` | `/api/projects/:id/translations/:lang/subtitles/:sid/confirm` | 确认待复核译文：`{version}`；非 review → `422`、版本过期 → `409`、规则不通过 → `422`（均返回当前值且不改数据） |
+| `POST` | `/api/projects/:id/translations/:lang/exports` | 校验并按语言导出译文 WebVTT；缺译/待复核/无效/整版冲突 → `422` 分类列出不生成快照（可带 `sub_version` 防呆，过期 → `409`） |
+| `GET` | `/api/projects/:id/translations/:lang/exports` | 某语言译文导出快照列表 |
+| `GET` | `/api/projects/:id/translations/:lang/exports/:version` | 下载某语言某版本译文 `.vtt`（内容创建后不变） |
 
 修订请求与核对说明：
 
@@ -157,21 +166,64 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 
 前端在左侧 ⑥ 面板提交（"填入所有词"会带当前 `sub_version` 与全部词的当前时间，删掉不改的词即可），右侧查看历史、受影响字幕与候选整版差异后一键确认；纯 HTTP 流程见 `examples/word-revisions-api.sh`。
 
+## 多语言译文字幕（保存 → 复核 → 按语言导出）
+
+译文**按原时间轴**维护：不复制/编辑时间，不携带词、切点、原文，只锚定"当前源字幕行"。同一项目可维护任意多种语言（代号如 `en`、`ja-JP`、`pt_BR`），同一语言每条当前字幕最多一份非历史译文。
+
+### 状态机
+
+| 状态 | 含义 | 可否导出 |
+|---|---|---|
+| `current` | 已保存且源文本/时间/词区间与保存快照一致 | 还须满足现行字数/字速规则才可导出 |
+| `review` | 保存后源字幕**文本/时间/词区间**发生变化（单条编辑、修订采纳、词修正确认、重排更新） | 否，须校对者确认或重新保存 |
+| `history` | 源行被重排删除或项目重新导入（`subtitle_id` 置空） | 否，仅留档；新排版的行是**缺译**，绝不按序号挪用 |
+
+仅**锁定切换**（`locked`）或**展示顺序**（`idx`）变化不会使译文失效；重排时词区间相同且文本/时间一致的未锁定行会保留 ID 与行版本（身份保持），词区间相同但内容被重排改变的行版本 +1 并令译文转 `review`。规则本身收紧不会立即改写状态，但查询/导出会按现行规则动态把译文标记为无效（`invalid_reasons`），此时导出同样被拒绝。
+
+### API 流程
+
+1. **保存/更新** `PUT /api/projects/:id/translations/:lang/subtitles/:sid`
+   `{"text":"Hello world","cue_version":1,"version":0}`
+   - `cue_version` 为读取时源字幕行版本；`version` 为译文版本，新建省略或传 `0`，更新必须传当前值。
+   - 成功：新建 `201`、更新 `200`，译文状态为 `current` 并记录源快照（原文/起止/词区间/行版本）。
+   - `400` 语言代号非法/空译文/缺行版本；`404` 字幕不存在；`409` 行版本或译文版本过期（带 `current`）；
+     `422` 译文超 `max_chars` 或沿用源行时间算出超 `max_cps`（不改任何数据）。
+2. **并列查询** `GET …/translations/:lang`（只读）
+   返回 `entries[]`：`cue`（原文/起止/词区间/行版本）、`translation`（无则 `null`）、`state`、`valid`、
+   `invalid_reasons`（现行字数/字速中文原因），以及 `counts`、该语言 `exports` 与 `history` 历史译文。
+3. **源变更联动**：单条编辑、重新排版、批量修订采纳、逐词修正确认、重新导入都会在事务内统一对账：
+   变化行译文转 `review`、删除行译文留 `history`。
+4. **确认待复核** `POST …/translations/:lang/subtitles/:sid/confirm`，`{"version":1}`
+   校对者对照当前原文核对后确认：刷新源快照、转回 `current`、译文版本 +1；
+   非 `review` → `422`；译文版本过期 → `409`；译文按现行规则无效 → `422`（返回当前值与原因，不改数据）。
+   也可不确认、直接重新 `PUT` 一版新译文（带行版本与当前译文版本）。
+5. **按语言导出** `POST …/translations/:lang/exports`（可带 `sub_version` 防呆）
+   - 先做源整版结构（词覆盖/不重叠/不跨切点/不缩短词时段）与现行规则校验，再核对每行均有 `current` 且合规的译文；
+   - 不通过 → `422` 分类返回 `missing`（缺译）、`review`（待复核）、`invalid`（译文超规则）、`conflicts`（整版冲突），**不生成快照**；
+   - 通过 → 译文沿用源行起止生成按时间升序的 WebVTT，存为该语言独立递增的不可变快照；
+     `GET …/translations/:lang/exports` 列版本、`GET …/translations/:lang/exports/:version` 下载，
+     后续修订不影响旧文件。各语言版本号独立；原文导出 `POST /api/projects/:id/exports` 流程保持不变。
+6. **语言总览** `GET …/translations`：每种语言的 current/review/历史条数与导出数。
+
+纯 HTTP 完整示例：`examples/translations-api.sh`（新建项目→保存→乐观锁与非法示例→并列查询→锁定/源变更失效→确认→重排历史与缺译→导出拒绝→双语言导出与快照下载）。浏览器内使用左侧 ⑦ 面板：填语言代号「载入语言」后逐行保存/确认，右上按钮校验并导出。
+
 ## 目录结构
 
 ```
 server.js            入口：初始化 SQLite、播种演示数据、启动 HTTP
-src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items）
+src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports）
 src/layout.js        排版引擎（纯函数）：切点分析 → 分段 → 定时 → 结构自检
 src/validate.js      导入与编辑校验
 src/revision.js      批量字幕修订提议：请求解析 + 整组候选核对（词区间/时间/切点/相邻/规则/版本）
 src/word-revision.js 逐词时间修正：请求解析 + 候选整版核对（词序重叠/锁定边界/受影响区间重排/规则/版本）
-src/vtt.js           WebVTT 序列化
+src/translation.js   多语言译文字幕：解析/规则校验/并列视图/失效对账（current→review/history）/导出核对
+src/vtt.js           WebVTT 序列化（原文与译文导出共用）
 src/routes.js        Express API
-public/              前端（原生 HTML/CSS/JS 单页，含字幕修订与逐词修正面板）
+public/              前端（原生 HTML/CSS/JS 单页，含字幕修订、逐词修正与多语言译文面板）
 examples/sample.json 示例转写与切点
 examples/revisions-api.sh 批量字幕修订提议的完整 curl 调用示例
 examples/word-revisions-api.sh 逐词时间修正（提交→预览→确认）的完整 curl 调用示例
-test/                node:test 单元 + API 集成测试（revision / word-revision 覆盖两类提议流程）
+examples/translations-api.sh 多语言译文字幕（保存→查询→失效/复核→确认→按语言导出）的完整 curl 调用示例
+test/                node:test 单元 + API 集成测试（revision / word-revision / translation 覆盖三类流程）
 Dockerfile / docker-compose.yml
 ```

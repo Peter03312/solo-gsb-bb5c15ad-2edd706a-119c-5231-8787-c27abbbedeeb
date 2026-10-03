@@ -6,6 +6,8 @@ const state = {
   projects: [],
   project: null,      // 当前项目完整载荷
   edits: new Map(),   // cueId -> { text, start_ms, end_ms } 未保存修改
+  trLang: null,       // 当前译文语言
+  trView: null,       // 该语言并列查询视图
 };
 
 // ---------- 工具 ----------
@@ -59,6 +61,9 @@ async function loadProjects(selectId) {
   }
   const id = selectId ?? state.projects[0].id;
   sel.value = id;
+  state.trLang = null;
+  state.trView = null;
+  $('#tr-panel').classList.add('hidden');
   await loadProject(Number(sel.value));
 }
 
@@ -67,6 +72,9 @@ async function loadProject(id) {
   if (status !== 200) { toast(body?.error || '加载项目失败', true); return; }
   state.project = body;
   state.edits.clear();
+  // 切换/刷新项目后重新载入当前语言视图（项目不同则收起面板）
+  if (state.trLang) loadTranslation(state.trLang);
+  else $('#tr-panel').classList.add('hidden');
   renderAll();
 }
 
@@ -837,6 +845,214 @@ async function newProject() {
   }
 }
 
+// ---------- 多语言译文字幕 ----------
+
+async function loadTranslation(lang) {
+  const p = state.project;
+  if (!p || !lang) return;
+  const { status, body } = await api(`/api/projects/${p.id}/translations/${encodeURIComponent(lang)}`);
+  if (status !== 200) { toast(body?.error || '加载译文失败', true); return; }
+  state.trLang = lang;
+  state.trView = body;
+  $('#tr-lang').value = lang;
+  renderTranslations();
+}
+
+function trStateTag(stateName, valid) {
+  if (stateName === 'missing') return '<span class="state">✗ 缺译</span>';
+  if (stateName === 'review') return '<span class="state" style="color:var(--warn,#b8860b)">⚠ 待复核</span>';
+  return valid
+    ? '<span class="state ok">✓ 当前有效</span>'
+    : '<span class="state" style="color:var(--danger)">✗ 规则不通过</span>';
+}
+
+function renderTranslations() {
+  const panel = $('#tr-panel');
+  const view = state.trView;
+  if (!view) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  $('#tr-lang-tag').textContent = view.lang;
+  const c = view.counts;
+  $('#tr-stats').textContent =
+    `共 ${c.cues} 条 · 当前 ${c.current}（有效 ${c.valid}）· 待复核 ${c.review} · 缺译 ${c.missing} · 历史 ${view.history.length}`;
+
+  const box = $('#tr-table');
+  box.innerHTML = '';
+  for (const e of view.entries) {
+    const cue = e.cue;
+    const row = document.createElement('div');
+    row.className = 'tr-row state-' + e.state + (e.valid ? ' valid' : '');
+
+    const idx = document.createElement('div');
+    idx.className = 'idx';
+    idx.innerHTML = `${cue.idx + 1}<div class="word-ref">#${cue.id} · 词${cue.word_start}–${cue.word_end} · v${cue.version}${cue.locked ? ' 🔒' : ''}</div>`;
+
+    const src = document.createElement('div');
+    src.className = 'tr-src';
+    src.innerHTML =
+      `<div class="tr-meta">${fmtMs(cue.start_ms)} → ${fmtMs(cue.end_ms)}</div>` +
+      `<div class="tr-src-text">${escapeHtml(cue.text)}</div>`;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'tr-edit';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'text-input';
+    input.value = e.translation ? e.translation.text : '';
+    input.placeholder = e.state === 'missing' ? '输入译文后保存…' : '';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const updateMeta = () => {
+      const len = input.value.length;
+      const dur = cue.end_ms - cue.start_ms;
+      const cps = dur > 0 ? (len / (dur / 1000)) : Infinity;
+      const badLen = len > view.rules.max_chars;
+      const badCps = cps > view.rules.max_cps;
+      meta.innerHTML =
+        `<span class="${badLen ? 'bad' : ''}">${len}/${view.rules.max_chars} 字</span> · ` +
+        `<span class="${badCps ? 'bad' : ''}">${isFinite(cps) ? cps.toFixed(1) : '∞'}字/s</span>`;
+    };
+    updateMeta();
+    input.addEventListener('input', updateMeta);
+
+    const tagLine = document.createElement('div');
+    tagLine.className = 'tr-tagline';
+    tagLine.innerHTML = trStateTag(e.state, e.valid) +
+      (e.translation ? ` <span class="hint">译文 v${e.translation.version}</span>` : '');
+    for (const reason of e.invalid_reasons) {
+      tagLine.innerHTML += `<div class="tr-reason">• ${escapeHtml(reason)}</div>`;
+    }
+    wrap.append(input, meta, tagLine);
+
+    const ops = document.createElement('div');
+    ops.className = 'ops';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'small primary';
+    saveBtn.textContent = '保存译文';
+    saveBtn.onclick = () => saveTranslation(cue, e, input.value);
+    ops.appendChild(saveBtn);
+    if (e.state === 'review') {
+      const confirmBtn = document.createElement('button');
+      confirmBtn.className = 'small secondary';
+      confirmBtn.textContent = '✓ 确认仍适用';
+      confirmBtn.onclick = () => confirmTranslation(cue, e);
+      ops.appendChild(confirmBtn);
+    }
+    wrap.appendChild(ops);
+
+    row.append(idx, src, wrap);
+    box.appendChild(row);
+  }
+
+  // 导出快照列表
+  const fillExports = (ul, list) => {
+    ul.innerHTML = '';
+    if (!list || list.length === 0) {
+      ul.innerHTML = '<li class="empty">尚无译文导出快照</li>';
+      return;
+    }
+    for (const ex of list) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = `/api/projects/${state.project.id}/translations/${encodeURIComponent(view.lang)}/exports/${ex.version}`;
+      a.textContent = `⬇ ${ex.lang} v${ex.version}.vtt`;
+      a.download = `project-${state.project.id}-${ex.lang}-v${ex.version}.vtt`;
+      const info = document.createElement('span');
+      info.className = 'hint';
+      info.textContent = `${ex.cue_count} 条 · ${ex.created_at}`;
+      li.append(a, info);
+      ul.appendChild(li);
+    }
+  };
+  fillExports($('#tr-export-list2'), view.exports || []);
+
+  // 历史译文
+  const hist = $('#tr-history');
+  hist.innerHTML = '';
+  if (view.history.length === 0) {
+    hist.innerHTML = '<div class="empty">无历史译文。</div>';
+  } else {
+    for (const h of view.history) {
+      const div = document.createElement('div');
+      div.className = 'tr-hist-item';
+      div.innerHTML =
+        `<span class="hint">#${h.id} 译文 v${h.version}（源快照：${h.src_start_ms}–${h.src_end_ms}ms，词${h.src_word_start}–${h.src_word_end}）</span> ` +
+        `“${escapeHtml(h.text)}”`;
+      hist.appendChild(div);
+    }
+  }
+}
+
+async function saveTranslation(cue, entry, text) {
+  const p = state.project;
+  const lang = state.trLang;
+  const payload = {
+    text,
+    cue_version: cue.version,
+    version: entry.translation ? entry.translation.version : 0,
+  };
+  const { status, body } = await api(
+    `/api/projects/${p.id}/translations/${encodeURIComponent(lang)}/subtitles/${cue.id}`,
+    { method: 'PUT', body: JSON.stringify(payload) }
+  );
+  if (status === 200 || status === 201) {
+    toast(`字幕 #${cue.idx + 1} 译文已保存（v${body.translation.version}，当前有效）`);
+    await loadTranslation(lang);
+  } else if (status === 409) {
+    toast(body.error + '，已刷新当前值', true);
+    await loadTranslation(lang);
+  } else {
+    toast((body?.errors || [body?.error || '保存失败']).join('；'), true);
+  }
+}
+
+async function confirmTranslation(cue, entry) {
+  const p = state.project;
+  const lang = state.trLang;
+  const { status, body } = await api(
+    `/api/projects/${p.id}/translations/${encodeURIComponent(lang)}/subtitles/${cue.id}/confirm`,
+    { method: 'POST', body: JSON.stringify({ version: entry.translation.version }) }
+  );
+  if (status === 200) {
+    toast(`字幕 #${cue.idx + 1} 译文已确认（v${body.translation.version}，恢复当前有效）`);
+    await loadTranslation(lang);
+  } else if (status === 409) {
+    toast(body.error + '，已刷新当前值', true);
+    await loadTranslation(lang);
+  } else {
+    toast((body?.errors || [body?.error || '确认失败']).join('；'), true);
+  }
+}
+
+async function exportTranslation() {
+  const p = state.project;
+  let lang = state.trLang || $('#tr-lang').value.trim();
+  if (!lang) return toast('请先填写目标语言代号并「载入语言」', true);
+  const { status, body } = await api(
+    `/api/projects/${p.id}/translations/${encodeURIComponent(lang)}/exports`,
+    { method: 'POST', body: JSON.stringify({ sub_version: p.sub_version }) }
+  );
+  if (status === 201) {
+    toast(`✓ ${lang} 译文已导出 v${body.version}（${body.cue_count} 条），快照不可变`);
+    state.trLang = lang;
+    await loadTranslation(lang);
+  } else if (status === 422) {
+    const parts = [];
+    if (body.missing?.length) parts.push(`缺译 ${body.missing.length} 条：${body.missing.slice(0, 4).map((m) => `#${m.subtitle_id}`).join('、')}`);
+    if (body.review?.length) parts.push(`待复核 ${body.review.length} 条`);
+    if (body.invalid?.length) parts.push(`规则不通过 ${body.invalid.length} 条`);
+    if (body.conflicts?.length) parts.push(`整版冲突 ${body.conflicts.length} 处：${body.conflicts.slice(0, 2).map((c) => c.message).join('｜')}`);
+    toast(body.error + (parts.length ? '：' + parts.join('；') : ''), true);
+    await loadTranslation(lang);
+  } else if (status === 409) {
+    toast(body.error, true);
+    await loadProject(p.id);
+  } else {
+    toast(body?.error || '导出失败', true);
+    if (status === 400) { /* 语言代号非法，不切换面板 */ }
+  }
+}
+
 // ---------- 示例数据 ----------
 
 const SAMPLE_WORDS = [
@@ -882,5 +1098,14 @@ $('#btn-rev-submit').addEventListener('click', submitRevision);
 $('#btn-rev-fill').addEventListener('click', fillRevisionTemplate);
 $('#btn-wr-submit').addEventListener('click', submitWordRevision);
 $('#btn-wr-fill').addEventListener('click', fillWordRevisionTemplate);
+$('#btn-tr-load').addEventListener('click', () => {
+  const lang = $('#tr-lang').value.trim();
+  if (!lang) return toast('请填写目标语言代号（如 en、ja-JP）', true);
+  loadTranslation(lang);
+});
+$('#tr-lang').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('#btn-tr-load').click(); }
+});
+$('#btn-tr-export').addEventListener('click', exportTranslation);
 
 loadProjects();

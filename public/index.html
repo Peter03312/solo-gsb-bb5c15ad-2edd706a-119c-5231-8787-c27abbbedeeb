@@ -95,6 +95,20 @@
         </div>
         <p class="hint">提交只保存原值快照、不动正式词与字幕；预览通过后再<strong>确认</strong>（原子更新词时间+重排+推进版本）。</p>
       </section>
+      <section class="panel">
+        <h2>⑦ 多语言译文字幕</h2>
+        <p class="hint">译文<strong>沿用源字幕的起止时间与词区间</strong>，不改词、切点与原文；保存须带读取时行版本与译文版本。
+        源字幕文本/时间/词区间变化后译文转<strong>待复核</strong>；仅锁定或展示顺序变化不失效；重排删除的原行译文留作历史，新行视为缺译。</p>
+        <div class="row">
+          <input id="tr-lang" type="text" placeholder="目标语言代号（如 en、ja-JP）" spellcheck="false">
+          <button id="btn-tr-load" class="secondary">载入语言</button>
+        </div>
+        <div class="row buttons">
+          <button id="btn-tr-export" class="primary wide">校验并导出该语言 WebVTT</button>
+        </div>
+        <ul id="tr-export-list" class="export-list"></ul>
+        <p class="hint">导出前须当前每行都有<strong>有效当前译文</strong>且整版符合时间与切点约束，否则列出缺漏/冲突且不生成快照；已导出快照不可变。</p>
+      </section>
     </aside>
 
     <section class="content">
@@ -121,6 +135,16 @@
       <div id="wr-detail-panel" class="panel hidden">
         <h2 id="wr-detail-title"></h2>
         <div id="wr-detail-body"></div>
+      </div>
+
+      <div id="tr-panel" class="panel hidden">
+        <h2>译文字幕 <span id="tr-lang-tag" class="tag"></span> <span id="tr-stats" class="hint"></span></h2>
+        <p class="hint">每条最多一份当前译文；保存即按现行最大字数/字速规则校验。<strong>待复核</strong>行请对照原文修改后重新保存，或直接「✓ 确认仍适用」。</p>
+        <div id="tr-table" class="tr-table"></div>
+        <h3>译文导出快照</h3>
+        <ul id="tr-export-list2" class="export-list"></ul>
+        <h3>历史译文（源行已重排删除/重新导入，不按序号挪用）</h3>
+        <div id="tr-history" class="tr-history"></div>
       </div>
 
       <div class="panel">

@@ -215,3 +215,28 @@ button.danger { background: transparent; border: 1px solid var(--danger); color:
   main { grid-template-columns: 1fr; }
   .cue-row { grid-template-columns: 28px 80px 80px 1fr 100px 130px; }
 }
+
+/* 多语言译文字幕 */
+.tr-table { display: flex; flex-direction: column; gap: 8px; }
+.tr-row {
+  display: grid; grid-template-columns: 86px 1fr; gap: 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); padding: 8px 12px;
+}
+.tr-row.state-review { border-color: #b8860b; background: rgba(184, 134, 11, 0.06); }
+.tr-row.state-missing { border-style: dashed; opacity: .92; }
+.tr-row .tr-src { border-left: 3px solid var(--border); padding-left: 10px; }
+.tr-row .tr-meta { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+.tr-row .tr-src-text { font-size: 13px; line-height: 1.5; }
+.tr-row .tr-edit { grid-column: 1 / -1; display: grid;
+  grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+.tr-row .tr-edit .text-input { width: 100%; }
+.tr-row .tr-tagline { grid-column: 1 / -1; font-size: 12px; }
+.tr-row .tr-tagline .state { color: var(--danger); font-size: 11px; }
+.tr-row .tr-tagline .state.ok { color: var(--ok); }
+.tr-row .tr-reason { color: var(--danger); font-size: 11px; line-height: 1.5; }
+.tr-row .ops { display: flex; gap: 6px; }
+.tr-history { display: flex; flex-direction: column; gap: 4px; }
+.tr-hist-item { font-size: 12px; color: var(--muted);
+  border: 1px dashed var(--border); border-radius: 6px; padding: 4px 8px; }
+#tr-panel h3 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); }
