@@ -117,6 +117,37 @@ CREATE TABLE IF NOT EXISTS word_revision_items (
   end_ms          INTEGER NOT NULL,           -- 修正后结束毫秒
   UNIQUE(word_revision_id, ord)
 );
+
+-- 多语言译文：绑定“源字幕行 ID + 目标语言代号”，时间轴沿用源行，只存文本与源行快照
+CREATE TABLE IF NOT EXISTS translations (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  subtitle_id    INTEGER NOT NULL,               -- 源字幕 ID；源行被删除后译文留作历史（故意不设外键）
+  lang           TEXT NOT NULL,                  -- 目标语言代号（保存时归一化为小写）
+  text           TEXT NOT NULL,                  -- 译文文本
+  version        INTEGER NOT NULL DEFAULT 1,     -- 译文行级乐观锁：每次保存/确认 +1
+  cue_version    INTEGER NOT NULL,               -- 保存/确认时读取的源字幕行版本
+  src_text       TEXT NOT NULL,                  -- 源行快照：文本/起止/词区间（据此派生“待复核”）
+  src_start_ms   INTEGER NOT NULL,
+  src_end_ms     INTEGER NOT NULL,
+  src_word_start INTEGER NOT NULL,
+  src_word_end   INTEGER NOT NULL,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, subtitle_id, lang)          -- 同一语言每条字幕最多一份译文
+);
+
+-- 译文 WebVTT 导出版本：按语言各自递增，生成后不可变
+CREATE TABLE IF NOT EXISTS translation_exports (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang       TEXT NOT NULL,
+  version    INTEGER NOT NULL,               -- 语言内递增，确认一次 +1
+  content    TEXT NOT NULL,                  -- 译文 WebVTT 快照，生成后不再改变
+  cue_count  INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, lang, version)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
@@ -267,7 +298,46 @@ function loadWordRevision(db, projectId, revisionId) {
   };
 }
 
+/** 单条译文行（按 项目 + 字幕 ID + 语言 定位）；不存在返回 null */
+function getTranslation(db, projectId, subtitleId, lang) {
+  return db.prepare(
+    'SELECT * FROM translations WHERE project_id = ? AND subtitle_id = ? AND lang = ?'
+  ).get(projectId, subtitleId, lang) || null;
+}
+
+/** 项目某语言的全部译文行（含源行已删除的历史译文），按 ID 升序 */
+function listTranslations(db, projectId, lang) {
+  return db.prepare(
+    'SELECT * FROM translations WHERE project_id = ? AND lang = ? ORDER BY id'
+  ).all(projectId, lang);
+}
+
+/** 项目全部译文行（不限语言，供语言汇总），按 ID 升序 */
+function listAllTranslations(db, projectId) {
+  return db.prepare(
+    'SELECT * FROM translations WHERE project_id = ? ORDER BY id'
+  ).all(projectId);
+}
+
+/** 项目某语言的译文导出版本列表（新→旧） */
+function listTranslationExports(db, projectId, lang) {
+  return db.prepare(
+    `SELECT lang, version, cue_count, created_at FROM translation_exports
+      WHERE project_id = ? AND lang = ? ORDER BY version DESC`
+  ).all(projectId, lang);
+}
+
+/** 项目全部译文导出版本列表（新→旧），供项目载荷与汇总 */
+function listAllTranslationExports(db, projectId) {
+  return db.prepare(
+    `SELECT lang, version, cue_count, created_at FROM translation_exports
+      WHERE project_id = ? ORDER BY lang, version DESC`
+  ).all(projectId);
+}
+
 module.exports = {
   initDb, loadProject, listRevisions, loadRevision,
   listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  getTranslation, listTranslations, listAllTranslations,
+  listTranslationExports, listAllTranslationExports,
 };

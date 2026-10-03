@@ -4,11 +4,17 @@ const express = require('express');
 const {
   loadProject, listRevisions, loadRevision,
   listWordRevisions, loadWordRevision, bumpSubVersion, DEFAULT_RULES,
+  getTranslation, listTranslations, listAllTranslations,
+  listTranslationExports,
 } = require('./db');
 const { computeLayout, validateStructure, validateRules } = require('./layout');
 const { validateWords, validateCuts, validateRules: validateRulesInput, validateSubtitleEdit } = require('./validate');
 const { parseRevisionItems, evaluateRevision } = require('./revision');
 const { parseWordRevisionItems, evaluateWordRevision } = require('./word-revision');
+const {
+  parseLang, parseTranslationBody, checkTranslationText, deriveStatus,
+  translationJson, assembleTranslations, summarizeLangs, evaluateTranslationExport,
+} = require('./translation');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -168,6 +174,9 @@ function createApp(db) {
     }
     const tx = db.transaction(() => {
       db.prepare('DELETE FROM subtitles WHERE project_id = ? AND locked = 0').run(p.id);
+      // 先把保留的锁定行 idx 挪到负的临时值（-id-1，必然互不相同），
+      // 避免新插入行的 idx 与锁定行当前 idx 临时撞号（UNIQUE(project_id, idx)）
+      db.prepare('UPDATE subtitles SET idx = -id - 1 WHERE project_id = ?').run(p.id);
       const ins = db.prepare(
         `INSERT INTO subtitles (project_id, idx, word_start, word_end, text, start_ms, end_ms, locked)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
@@ -311,6 +320,323 @@ function createApp(db) {
     res.setHeader(
       'Content-Disposition',
       `attachment; filename="project-${p.id}-v${row.version}.vtt"`
+    );
+    res.send(row.content);
+  });
+
+  // ---------- 多语言译文（按原时间轴维护：保存 → 复核 → 按语言导出） ----------
+  //
+  // 译文绑定“源字幕行 ID + 目标语言代号”，沿用源行起止与词区间，只保存文本：
+  //   保存/确认携带非空语言代号、字幕 ID、读取时行版本与译文版本（乐观锁）；
+  //   译文文本按当前规则核对最大字数与每秒字数，不改词、切点与原文；
+  //   源行文本/时间/词区间变化 → 译文派生为“待复核”；仅锁定或展示顺序变化不失效；
+  //   源行被重排/导入删除 → 译文留作历史，新行视为缺译，绝不按序号挪用；
+  //   按语言导出前要求当前每行均有有效译文且整版通过时间与切点校验，
+  //   否则列出缺漏/冲突且不生成快照；已导出的译文版本不可变。
+
+  /** 语言汇总：每种语言的有效/待复核/缺译/历史数量与已导出版本数 */
+  app.get('/api/projects/:id/translations', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const langs = summarizeLangs(p, listAllTranslations(db, p.id));
+    const exportCounts = db.prepare(
+      `SELECT lang, COUNT(*) AS n, MAX(version) AS latest_version
+         FROM translation_exports WHERE project_id = ? GROUP BY lang`
+    ).all(p.id);
+    const byLang = new Map(langs.map((b) => [b.lang, b]));
+    for (const row of exportCounts) {
+      let bucket = byLang.get(row.lang);
+      if (!bucket) {
+        bucket = { lang: row.lang, ok: 0, needs_review: 0, missing: p.subtitles.length, history: 0 };
+        byLang.set(row.lang, bucket);
+        langs.push(bucket);
+      }
+      bucket.exports = row.n;
+      bucket.latest_export_version = row.latest_version;
+    }
+    for (const b of langs) {
+      if (b.exports === undefined) { b.exports = 0; b.latest_export_version = null; }
+    }
+    langs.sort((a, b) => (a.lang < b.lang ? -1 : a.lang > b.lang ? 1 : 0));
+    res.json(langs);
+  });
+
+  /** 并列查询：当前每条字幕并列原文与译文（含派生状态），源行已删的译文列入 history */
+  app.get('/api/projects/:id/translations/:lang', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lg = parseLang(req.params.lang);
+    if (!lg.ok) return res.status(400).json({ error: lg.error });
+    res.json(assembleTranslations(p, listTranslations(db, p.id, lg.lang), lg.lang));
+  });
+
+  /**
+   * 保存译文（新建或更新）：{ subtitle_id, text, cue_version, translation_version? }
+   * 新建时无需 translation_version；更新时必须携带读取时的译文版本。
+   * 行版本/译文版本过期 → 409 + 当前值；译文违反当前字数/字速规则 → 422 + 原因，均不改数据。
+   */
+  app.put('/api/projects/:id/translations/:lang', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lg = parseLang(req.params.lang);
+    if (!lg.ok) return res.status(400).json({ error: lg.error });
+    const parsed = parseTranslationBody(req.body, { requireText: true });
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '译文请求非法，未保存', errors: parsed.errors });
+    }
+
+    const cue = p.subtitles.find((s) => s.id === parsed.subtitle_id) || null;
+    const existing = getTranslation(db, p.id, parsed.subtitle_id, lg.lang);
+    const currentPayload = () => ({
+      subtitle: cue,
+      translation: existing ? translationJson(existing, cue, p.rules) : null,
+    });
+    if (!cue) {
+      return res.status(404).json({
+        error: `字幕 ${parsed.subtitle_id} 不存在（可能已被重排删除），译文只能保存在当前源行上`,
+        current: currentPayload(),
+      });
+    }
+    if (parsed.cue_version !== cue.version) {
+      return res.status(409).json({
+        error: `字幕行版本过期：你基于行 v${parsed.cue_version} 读取，当前已是 v${cue.version}，请刷新后重试`,
+        current: currentPayload(),
+      });
+    }
+    if (existing) {
+      if (parsed.translation_version !== existing.version) {
+        return res.status(409).json({
+          error:
+            `译文版本过期：该字幕已有 ${lg.lang} 译文 v${existing.version}` +
+            '（保存时必须携带读取时的译文版本），请刷新后重试',
+          current: currentPayload(),
+        });
+      }
+    } else if (parsed.translation_version !== null) {
+      return res.status(409).json({
+        error: `该字幕当前没有 ${lg.lang} 译文，translation_version 不适用（新建时请勿携带），请刷新后重试`,
+        current: currentPayload(),
+      });
+    }
+    const problems = checkTranslationText(parsed.text, cue, p.rules);
+    if (problems.length > 0) {
+      return res.status(422).json({
+        error: '译文未通过当前字数/字速规则，未保存',
+        errors: problems.map((x) => x.message),
+        current: currentPayload(),
+      });
+    }
+
+    // 写入（事务 + 版本/唯一约束兜底）：新建或更新，并记录当前源行快照
+    const tx = db.transaction(() => {
+      if (existing) {
+        const info = db.prepare(
+          `UPDATE translations
+             SET text = ?, version = version + 1, cue_version = ?,
+                 src_text = ?, src_start_ms = ?, src_end_ms = ?,
+                 src_word_start = ?, src_word_end = ?, updated_at = datetime('now')
+           WHERE id = ? AND version = ?`
+        ).run(
+          parsed.text, cue.version,
+          cue.text, cue.start_ms, cue.end_ms, cue.word_start, cue.word_end,
+          existing.id, existing.version
+        );
+        return info.changes === 1 ? { id: existing.id, created: false } : { conflict: true };
+      }
+      try {
+        const info = db.prepare(
+          `INSERT INTO translations
+             (project_id, subtitle_id, lang, text, cue_version,
+              src_text, src_start_ms, src_end_ms, src_word_start, src_word_end)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          p.id, cue.id, lg.lang, parsed.text, cue.version,
+          cue.text, cue.start_ms, cue.end_ms, cue.word_start, cue.word_end
+        );
+        return { id: info.lastInsertRowid, created: true };
+      } catch (err) {
+        if (String(err.message).includes('UNIQUE')) return { conflict: true };
+        throw err;
+      }
+    });
+    const result = tx();
+    if (result.conflict) {
+      const freshTr = getTranslation(db, p.id, parsed.subtitle_id, lg.lang);
+      return res.status(409).json({
+        error: '译文在保存瞬间被并发修改，请刷新后重试',
+        current: {
+          subtitle: cue,
+          translation: freshTr ? translationJson(freshTr, cue, p.rules) : null,
+        },
+      });
+    }
+    const row = db.prepare('SELECT * FROM translations WHERE id = ?').get(result.id);
+    res.status(result.created ? 201 : 200).json({
+      lang: lg.lang,
+      subtitle_id: cue.id,
+      translation: translationJson(row, cue, p.rules),
+    });
+  });
+
+  /**
+   * 确认待复核译文：{ subtitle_id, cue_version, translation_version }
+   * 在当前源行上核对：行版本与译文版本过期 → 409 + 当前值；译文违反当前规则 → 422 + 原因；
+   * 源行已删除 → 409（译文留作历史，不能确认到任何当前行）。通过则把源行快照刷新为
+   * 当前值、译文版本 +1，状态回到“有效”；已有效的译文幂等返回，不改数据。
+   */
+  app.post('/api/projects/:id/translations/:lang/confirm', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lg = parseLang(req.params.lang);
+    if (!lg.ok) return res.status(400).json({ error: lg.error });
+    const parsed = parseTranslationBody(req.body, { requireText: false });
+    if (!parsed.ok || parsed.translation_version === null) {
+      const errors = parsed.errors.concat(
+        parsed.translation_version === null ? ['translation_version（读取时译文版本）必须携带'] : []
+      );
+      return res.status(400).json({ error: '确认请求非法，未确认', errors });
+    }
+
+    const tr = getTranslation(db, p.id, parsed.subtitle_id, lg.lang);
+    if (!tr) {
+      return res.status(404).json({ error: `字幕 ${parsed.subtitle_id} 没有 ${lg.lang} 译文，无法确认` });
+    }
+    const cue = p.subtitles.find((s) => s.id === parsed.subtitle_id) || null;
+    if (!cue) {
+      return res.status(409).json({
+        error:
+          `源字幕 ${parsed.subtitle_id} 已被重排/重新导入删除，该译文留作历史，` +
+          '不能在当前源行上确认；新源行请重新保存译文',
+        current: { subtitle: null, translation: translationJson(tr, null, null) },
+      });
+    }
+    const currentPayload = () => ({ subtitle: cue, translation: translationJson(tr, cue, p.rules) });
+    if (parsed.translation_version !== tr.version) {
+      return res.status(409).json({
+        error: `译文版本过期：你基于译文 v${parsed.translation_version} 读取，当前已是 v${tr.version}，请刷新后重试`,
+        current: currentPayload(),
+      });
+    }
+    if (parsed.cue_version !== cue.version) {
+      return res.status(409).json({
+        error: `字幕行版本过期：你基于行 v${parsed.cue_version} 读取，当前已是 v${cue.version}，请刷新后重新核对`,
+        current: currentPayload(),
+      });
+    }
+    const problems = checkTranslationText(tr.text, cue, p.rules);
+    if (problems.length > 0) {
+      return res.status(422).json({
+        error: '译文未通过当前字数/字速规则，无法确认，请先保存修正后的译文',
+        errors: problems.map((x) => x.message),
+        current: currentPayload(),
+      });
+    }
+    if (deriveStatus(tr, cue) === 'ok') {
+      // 源行未变化：幂等返回，不改数据
+      return res.json({
+        lang: lg.lang, subtitle_id: cue.id, unchanged: true,
+        translation: translationJson(tr, cue, p.rules),
+      });
+    }
+
+    const tx = db.transaction(() => {
+      const info = db.prepare(
+        `UPDATE translations
+           SET version = version + 1, cue_version = ?,
+               src_text = ?, src_start_ms = ?, src_end_ms = ?,
+               src_word_start = ?, src_word_end = ?, updated_at = datetime('now')
+         WHERE id = ? AND version = ?`
+      ).run(
+        cue.version, cue.text, cue.start_ms, cue.end_ms, cue.word_start, cue.word_end,
+        tr.id, tr.version
+      );
+      return info.changes === 1;
+    });
+    if (!tx()) {
+      return res.status(409).json({ error: '译文在确认瞬间被并发修改，请刷新后重试' });
+    }
+    const row = db.prepare('SELECT * FROM translations WHERE id = ?').get(tr.id);
+    res.json({ lang: lg.lang, subtitle_id: cue.id, translation: translationJson(row, cue, p.rules) });
+  });
+
+  /**
+   * 按语言导出译文 WebVTT：当前每行都须有有效译文，且整版通过时间与切点校验，
+   * 否则列出缺漏/冲突并不生成快照；成功导出的版本不可变（可带 sub_version 防呆）。
+   */
+  app.post('/api/projects/:id/translations/:lang/exports', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lg = parseLang(req.params.lang);
+    if (!lg.ok) return res.status(400).json({ error: lg.error });
+    const { sub_version } = req.body || {};
+    if (sub_version !== undefined && sub_version !== p.sub_version) {
+      return res.status(409).json({
+        error: `字幕集已被修改（当前版本 ${p.sub_version}），请刷新后再确认导出`,
+        current: { sub_version: p.sub_version, subtitles: p.subtitles },
+      });
+    }
+    if (p.subtitles.length === 0) {
+      return res.status(422).json({ error: '没有字幕可导出，请先排版', missing: [], conflicts: [] });
+    }
+    if (p.words.length === 0) {
+      return res.status(422).json({ error: '尚未导入逐词转写', missing: [], conflicts: [] });
+    }
+    const assembled = assembleTranslations(p, listTranslations(db, p.id, lg.lang), lg.lang);
+    const evaluation = evaluateTranslationExport({ project: p, assembled });
+    if (!evaluation.ok) {
+      return res.status(422).json({
+        error:
+          `译文未通过导出校验（缺漏 ${evaluation.missing.length} 处 / ` +
+          `冲突 ${evaluation.conflicts.length} 处），未生成快照`,
+        missing: evaluation.missing,
+        conflicts: evaluation.conflicts,
+      });
+    }
+    const content = toWebVtt(evaluation.cues);
+    const tx = db.transaction(() => {
+      const next = (db.prepare(
+        'SELECT COALESCE(MAX(version), 0) AS v FROM translation_exports WHERE project_id = ? AND lang = ?'
+      ).get(p.id, lg.lang).v) + 1;
+      db.prepare(
+        'INSERT INTO translation_exports (project_id, lang, version, content, cue_count) VALUES (?, ?, ?, ?, ?)'
+      ).run(p.id, lg.lang, next, content, evaluation.cues.length);
+      return next;
+    });
+    const version = tx();
+    res.status(201).json({
+      lang: lg.lang,
+      version,
+      cue_count: evaluation.cues.length,
+      download_url: `/api/projects/${p.id}/translations/${lg.lang}/exports/${version}`,
+      content,
+    });
+  });
+
+  /** 某语言的译文导出版本列表 */
+  app.get('/api/projects/:id/translations/:lang/exports', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lg = parseLang(req.params.lang);
+    if (!lg.ok) return res.status(400).json({ error: lg.error });
+    res.json(listTranslationExports(db, p.id, lg.lang));
+  });
+
+  /** 下载某语言的某个译文导出版本（内容创建后不变） */
+  app.get('/api/projects/:id/translations/:lang/exports/:version', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lg = parseLang(req.params.lang);
+    if (!lg.ok) return res.status(400).json({ error: lg.error });
+    const row = db.prepare(
+      'SELECT * FROM translation_exports WHERE project_id = ? AND lang = ? AND version = ?'
+    ).get(p.id, lg.lang, Number(req.params.version));
+    if (!row) {
+      return res.status(404).json({ error: `译文导出版本 ${lg.lang} v${req.params.version} 不存在` });
+    }
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="project-${p.id}-${lg.lang}-v${row.version}.vtt"`
     );
     res.send(row.content);
   });
